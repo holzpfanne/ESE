@@ -25,12 +25,18 @@
 /* USER CODE BEGIN Includes */
 #include "stdio.h"
 #include "retarget.h"
+#include "string.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 struct data{
 	char up[11], down[11];
+};
+
+struct delaystruct{
+	uint16_t time;
+	uint8_t producer;
 };
 /* USER CODE END PTD */
 
@@ -43,6 +49,13 @@ struct data{
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
+_Bool full = FALSE;
+uint32_t plus = 0, minus = -1;
+struct data put;
+
+//input buffer
+char input[20] = {0};
+char* input_pointer = input;
 
 /* USER CODE END PM */
 
@@ -74,13 +87,18 @@ const osThreadAttr_t Producer3_attributes = {
 osThreadId_t MonitorHandle;
 const osThreadAttr_t Monitor_attributes = {
   .name = "Monitor",
-  .stack_size = 128 * 4,
+  .stack_size = 256 * 4,
   .priority = (osPriority_t) osPriorityHigh,
 };
 /* Definitions for FIFO */
 osMessageQueueId_t FIFOHandle;
 const osMessageQueueAttr_t FIFO_attributes = {
   .name = "FIFO"
+};
+/* Definitions for delayPipe */
+osMessageQueueId_t delayPipeHandle;
+const osMessageQueueAttr_t delayPipe_attributes = {
+  .name = "delayPipe"
 };
 /* USER CODE BEGIN PV */
 
@@ -93,12 +111,19 @@ static void MX_USART2_UART_Init(void);
 void ProducerTask(void *argument);
 void MonitorTask(void *argument);
 
+static void MX_NVIC_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+void RXISR(UART_HandleTypeDef *huart){
+	//write UART to internal buffer for later processing
+	HAL_UART_Receive(&huart2, (uint8_t*)input_pointer, 1, 1);
+	input_pointer++;
+}
 
 /* USER CODE END 0 */
 
@@ -131,8 +156,11 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_USART2_UART_Init();
-  /* USER CODE BEGIN 2 */
 
+  /* Initialize interrupts */
+  MX_NVIC_Init();
+  /* USER CODE BEGIN 2 */
+  RetargetInit(&huart2);
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -153,6 +181,9 @@ int main(void)
   /* Create the queue(s) */
   /* creation of FIFO */
   FIFOHandle = osMessageQueueNew (16, sizeof(struct data), &FIFO_attributes);
+
+  /* creation of delayPipe */
+  delayPipeHandle = osMessageQueueNew (4, sizeof(struct delaystruct), &delayPipe_attributes);
 
   /* USER CODE BEGIN RTOS_QUEUES */
   /* add queues, ... */
@@ -258,6 +289,17 @@ void SystemClock_Config(void)
 }
 
 /**
+  * @brief NVIC Configuration.
+  * @retval None
+  */
+static void MX_NVIC_Init(void)
+{
+  /* USART2_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(USART2_IRQn, 1, 0);
+  HAL_NVIC_EnableIRQ(USART2_IRQn);
+}
+
+/**
   * @brief USART2 Initialization Function
   * @param None
   * @retval None
@@ -287,6 +329,10 @@ static void MX_USART2_UART_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN USART2_Init 2 */
+
+  //enable Rx interrupt
+  huart2.Instance->CR1 |= USART_CR1_RXNEIE;
+  huart2.RxISR = &RXISR;
 
   /* USER CODE END USART2_Init 2 */
 
@@ -332,17 +378,35 @@ static void MX_GPIO_Init(void)
 void ProducerTask(void *argument)
 {
   /* USER CODE BEGIN 5 */
-	uint32_t plus = 0, minus = -1;
-	struct data put;
-	volatile _Bool full = FALSE;
+	uint8_t delaytime = 100;
+	struct delaystruct delay;
+
   /* Infinite loop */
   for(;;)
   {
-    sprintf(put.up, "%lu", ++plus);
+    memset(&put, 0, sizeof(struct data));
+    //change data and write to struct as string
+	sprintf(put.up, "%lu", ++plus);
     sprintf(put.down, "%lu", --minus);
-    if(osMessageQueuePut(FIFOHandle, &put, 0, 0) != osOK){full = TRUE;}
-    else{full = FALSE;}
-	osDelay(100);
+
+    //put data into Queue
+    if(osMessageQueuePut(FIFOHandle, &put, 0, 0) == osOK){full = FALSE;}
+    else{
+    	full = TRUE;
+    }
+    //check if delaytime Queue has an objet
+    if(osMessageQueueGet(delayPipeHandle, &delay, 0, 0) == osOK){
+    	if(delay.producer != (int)argument){
+    		//is wrong producer, put back into queue
+    		osMessageQueuePut(delayPipeHandle, &delay, 0, 0);
+    	}
+    	else{
+    		//set delay
+    		delaytime = delay.time;
+    	}
+    }
+
+	osDelay(delaytime);
   }
   /* USER CODE END 5 */
 }
@@ -358,12 +422,45 @@ void MonitorTask(void *argument)
 {
   /* USER CODE BEGIN MonitorTask */
   struct data get;
+  int producer = 0, delaytime = 0;
+  struct delaystruct delay;
+
   /* Infinite loop */
   for(;;)
   {
+	  //get data from queue and print it
 	  if(osMessageQueueGet(FIFOHandle, &get, 0, 0) == osOK){
-		  printf(" plus: %s\nminus: %s\n", get.up, get.down);
+		  printf(" plus: %s\nminus: %s\n%s", get.up, get.down, full ? "Queue full !!!\n" : "");
 	  }
+	  //read from UART buffer writen to by interrupt; not using scanf because it blocks for ever if nothing is read
+	  if (input[0] != 0 && strchr(input, 's') != NULL){  //check if data it transfered completely
+		  if(sscanf(input, "T%d %d", &producer, &delaytime) == 2){
+			  if(producer > 3){
+				  printf("----------------> No %d. Producer", producer);
+			  }
+			  else{
+				  //put delay time and producer into Queue
+				  delay.time = delaytime;
+				  delay.producer = producer;
+				  if(osMessageQueuePut(delayPipeHandle, &delay, 0, 0) != osOK) { printf("delay Pipline full!!!");}
+				  printf("Producer %d delay set to %dms\n", producer, delaytime);
+			  }
+
+			  //clear input buffer
+			  memset(&input, 0, 20);
+			  input_pointer = input;
+		  }
+		  else{
+			  printf("----------------> data invalid \"%s\"\n", input);
+		  }
+	  }
+	  /*
+	  //for debugging
+	  printf("==================> stack high water mark: %ld\n", uxTaskGetStackHighWaterMark(MonitorHandle));
+	  printf("==================> stack high water mark: %ld\n", uxTaskGetStackHighWaterMark(Producer1Handle));
+	  printf("==================> stack high water mark: %ld\n", uxTaskGetStackHighWaterMark(Producer2Handle));
+	  printf("==================> stack high water mark: %ld\n", uxTaskGetStackHighWaterMark(Producer3Handle));
+	  */
 	  osDelay(100);
   }
   /* USER CODE END MonitorTask */
